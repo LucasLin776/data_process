@@ -20,7 +20,6 @@
 V3 增加 10 ms 局部变化检测，以及“全段 RMS + 峰值”双限制低能量门控。
 门控默认值按数字满量程设定，不是设备标准；可用 --quiet-reference 指定
 一条已确认停机的 WAV，用其 RMS 与峰值的 3 倍校准门控（仍需人工复核）。
-旧版 V1/V2 模型不适用，不能加载旧 model.json。
 """
 from __future__ import annotations
 
