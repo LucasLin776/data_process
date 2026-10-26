@@ -1,6 +1,6 @@
 # 螺栓掉落声音数据增强
 
-用人工标注的螺栓掉落事件，与真实正常运行背景按指定信噪比混合；输出WAV、时间标签、训练清单和来源/质量日志。这个目录只准备训练数据，不训练检测模型。
+用人工标注的螺栓掉落事件，与真实正常运行背景按指定信噪比混合；输出连续编号的WAV、时域波形图、STFT时频图、时间标签、训练清单和来源/质量日志。这个目录只准备训练数据，不训练检测模型。
 
 ## 1. 当前已确认的数据
 
@@ -26,7 +26,7 @@ python -m pip install -r requirements.txt
 python augment.py generate --config augmentation.json --output output\bolt_aug_v2
 ```
 
-`output\bolt_aug_v1` 已由本次实际运行生成，重新运行请换一个新目录。输出目录已存在时会报错，不覆盖旧结果。依赖只有NumPy、SciPy、SoundFile；做增强不需要安装PyTorch或GPU。
+`output\bolt_aug_v1` 已实际生成并完成编号迁移和补图，重新生成请换一个新目录。输出目录已存在时会报错，不覆盖旧结果。依赖为NumPy、SciPy、SoundFile和Matplotlib；做增强不需要安装PyTorch或GPU。
 
 只扫描音频质量：
 
@@ -44,7 +44,7 @@ python augment.py scan --input "C:\Users\tlzn\Desktop\数据增强" --output rep
 4. 按标注事件区间计算前景和对应背景功率，设置-5、0、5、10 dB，每档随机放置2次。
 5. 每条混合正例配一条不插入事件的负例，两条使用相同背景片段、相同全局增益，降低背景响度成为类别线索的风险。
 6. 按正例和配对负例的共同峰值计算必要衰减，再叠加随机-6～0 dB全局增益；不硬裁剪、不压缩动态，不把每条音频都归一化到同一峰值。
-7. 保留一份每条真实来源的统一格式版本，并生成来源、变换参数和质量日志。
+7. 保留一份每条真实来源的统一格式版本。每写出一条WAV，立即读取实际写出的音频生成波形图和时频图，再记录来源、变换参数和质量日志。
 
 公式：`mixed = (background + alpha * foreground_shifted) * common_gain`。
 
@@ -65,23 +65,38 @@ python augment.py scan --input "C:\Users\tlzn\Desktop\数据增强" --output rep
 
 ```text
 output/bolt_aug_v1/
-  audio/                   73条WAV
-  labels/                  33份含事件WAV对应的Audition CSV
+  audio/                   01.wav、02.wav……73.wav
+  waveforms/               01.png、02.png……73.png，时域波形图
+  spectrograms/            01.png、02.png……73.png，STFT时频图
+  labels/                  33份正例对应的同编号Audition CSV
   train.jsonl              兼容 D:/project_sound 的数据清单格式
   augmentation_log.jsonl   每条的SNR、位置、增益、配对关系和质量
   quality.csv              输出音频质量表
   sources.json             来源路径、SHA256、原始标签及源质量
   config_used.json          配置快照
   summary.json              数量、质量提示、耗时和完成状态
+  renaming_map.csv          本次已有结果迁移的旧名→新名映射（新生成批次不需要）
 ```
 
-`original_`是来源格式统一版本，`pos_`是混合正例，`neg_`是配对背景负例。干扰负例前缀为`original_interference_`。
+文件名从`01`开始逐条编号，不包含类别、来源、信噪比或配对关系；超过99条后继续使用`100`、`101`等。比如`audio/01.wav`对应`waveforms/01.png`、`spectrograms/01.png`，如果含事件则另有`labels/01.csv`。
+
+`recording_id`与编号一致。原来的`original_`、`pos_`、`neg_`等描述保存在`derivation_id`字段，来源与配对关系保存在`source_ids`和增强日志中。打乱训练读取顺序时，按清单保持音频、标签的对应关系。
+
+两类图片都只显示编号，标题不写类别或信噪比。波形图横轴为秒、纵轴为数字满量程比例，固定范围约为-1～1；长音频按块画最小/最大包络，保留短冲击峰值。时频图使用Hann窗STFT，默认1024采样点窗口、256采样点步长（32 kHz下为32 ms/8 ms），覆盖0～16 kHz；色标固定-100～0 dB，相对于1 FS的STFT幅值，不是经过声学校准的dB SPL。图片只用于查看，不替代模型的特征提取。
 
 只有正例有范围标记；负例由清单中的`events: []`明确表示，不伪造空标签。一条WAV一条JSONL记录；一个原文件的多个标记分别参与混合，来源正例版本保留全部标记。
 
 `reviewed: true`表示来源类别和标注已确认、输出标签确定性转换，**不代表每条生成音频已人工试听**。`annotation.output_listened_by_human`为false。建议试听各背景/SNR下的代表样本再决定是否用于训练。
 
 运行中断时目录保留`RUNNING.json`，不要用于训练；成功时移除此标志，`summary.json`的`status`必须为`complete`。
+
+### 已有结果改名与补图
+
+```bat
+python augment.py renumber --input output\bolt_aug_v1
+```
+
+命令在临时副本中同步更新WAV名、标记名、清单、日志和质量表，补齐两类图片；核对WAV的SHA256并完整备份后，逐文件替换，兼容Windows中打开的目录。音频内容和事件起止不改变，旧结果备份到`output/_backups/`，具体路径写入`summary.json`的`renumber_backup`。迁移完成后再次执行会报告`unchanged`。本次73条已有结果已经执行完成，不需要你再操作。迁移中`RENUMBERING.json`表示尚未完成；文件替换失败时会尝试从备份回滚。
 
 ## 5. 接入已有检测项目
 
@@ -113,8 +128,8 @@ python -m bolt_audio check-data --manifest "C:\Users\tlzn\Desktop\data_process\o
 
 ## 7. 代码阅读与检查
 
-- `augment.py`：`read_audio`读取/质量检查，`read_markers`标注解析，`event_clip`截取，`mix_at_snr`混合，`generate`整套输出。
-- `tests/test_augment.py`：SNR、配对增益、标签往返、多事件、拒绝条件、重采样、复现性和输出质量检查。
+- `augment.py`：`read_audio`读取/质量检查，`read_markers`标注解析，`event_clip`截取，`mix_at_snr`混合，`render_audio_plots`生成两类图片，`generate`整套输出，`renumber_existing`迁移既有结果。
+- `tests/test_augment.py`：SNR、配对增益、标签往返、多事件、拒绝条件、重采样、复现性、输出质量，以及编号迁移时文件内容/引用一致性检查。
 
 ```bat
 python -m unittest discover -s tests -v

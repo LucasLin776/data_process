@@ -1,9 +1,11 @@
 """验证SNR、标签、来源隔离和写出质量，不用于证明真实识别性能。"""
 import copy
+import csv
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
@@ -17,6 +19,7 @@ from augment import (
     mix_at_snr,
     read_audio,
     read_markers,
+    renumber_existing,
     sha256,
 )
 
@@ -124,14 +127,18 @@ class FileTests(unittest.TestCase):
         rows = [json.loads(line) for line in (first / "train.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual({row["split"] for row in rows}, {"train"})
         self.assertEqual({row["group_id"] for row in rows}, {"one_training_component"})
+        self.assertEqual([row["recording_id"] for row in rows], [f"{index:02d}" for index in range(1, 12)])
         for row in rows:
             x, sr = sf.read(first / row["audio"])
             self.assertEqual(len(x), sr * 2)
             self.assertLessEqual(abs(x).max(), .95004)
+            for path in row["plots"].values():
+                self.assertEqual((first / path).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+                self.assertEqual(Path(path).stem, row["recording_id"])
             if row["events"]:
                 imported = read_markers(first / row["labels"], 2)
                 self.assertEqual(imported, row["events"])
-        original = next(row for row in rows if row["recording_id"] == "original_bolt")
+        original = next(row for row in rows if row["derivation_id"] == "original_bolt")
         self.assertEqual(len(original["events"]), 2)
         generate(config, second)
         for path in (first / "audio").glob("*.wav"):
@@ -172,6 +179,87 @@ class FileTests(unittest.TestCase):
         self.assertGreater(np.sqrt(np.mean(x ** 2)), .01)
         with self.assertRaises(ValueError):
             read_audio(path, 8000, channel=2)
+
+    def make_legacy_dataset(self):
+        self.make_config()
+        root = self.root / "legacy"
+        (root / "audio").mkdir(parents=True)
+        (root / "labels").mkdir()
+        rows = []
+        # 故意让旧文件名和目标编号形成交换，验证不会覆盖另一个样本。
+        for old_id, source, events in [
+            ("02", "fg.wav", [{"start_s": .4, "end_s": .65}]),
+            ("01", "bg.wav", []),
+        ]:
+            audio = f"audio/{old_id}.wav"
+            (root / audio).write_bytes((self.root / source).read_bytes())
+            labels = f"labels/{old_id}.csv" if events else None
+            if labels:
+                export_markers(root / labels, events)
+            rows.append({"recording_id": old_id, "audio": audio, "labels": labels,
+                         "events": events, "group_id": "train_group", "split": "train", "reviewed": True})
+        for name in ("train.jsonl", "augmentation_log.jsonl"):
+            (root / name).write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        with (root / "quality.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["recording_id", "rms"])
+            writer.writeheader()
+            writer.writerows({"recording_id": row["recording_id"], "rms": .1} for row in rows)
+        (root / "summary.json").write_text(json.dumps({"status": "complete", "total_recordings": 2}), encoding="utf-8")
+        return root, rows
+
+    def test_migration_preserves_wav_content_and_updates_all_references(self):
+        root, before = self.make_legacy_dataset()
+        hashes = [sha256(root / row["audio"]) for row in before]
+        result = renumber_existing(root)
+        after = [json.loads(line) for line in (root / "train.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["recording_id"] for row in after], ["01", "02"])
+        self.assertEqual([sha256(root / row["audio"]) for row in after], hashes)
+        self.assertEqual([sha256(Path(result["backup"]) / row["audio"]) for row in before], hashes)
+        self.assertEqual(read_markers(root / "labels/01.csv", 2), before[0]["events"])
+        self.assertEqual(len(list((root / "waveforms").glob("*.png"))), 2)
+        self.assertEqual(len(list((root / "spectrograms").glob("*.png"))), 2)
+        logs = [json.loads(line) for line in (root / "augmentation_log.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(logs, after)
+        with (root / "quality.csv").open(encoding="utf-8-sig", newline="") as stream:
+            self.assertEqual([row["recording_id"] for row in csv.DictReader(stream)], ["01", "02"])
+        with (root / "renaming_map.csv").open(encoding="utf-8-sig", newline="") as stream:
+            self.assertEqual([row["old_recording_id"] for row in csv.DictReader(stream)], ["02", "01"])
+        self.assertEqual(renumber_existing(root)["status"], "unchanged")
+
+    def test_migration_rejects_unlisted_audio_without_modifying_originals(self):
+        root, rows = self.make_legacy_dataset()
+        hashes = [sha256(root / row["audio"]) for row in rows]
+        (root / "audio/extra.wav").write_bytes((self.root / "bg.wav").read_bytes())
+        with self.assertRaises(ValueError):
+            renumber_existing(root)
+        self.assertEqual([sha256(root / row["audio"]) for row in rows], hashes)
+        self.assertFalse((self.root / "_backups").exists())
+
+    def test_migration_rejects_file_references_outside_dataset(self):
+        root, rows = self.make_legacy_dataset()
+        rows[0]["audio"] = "../fg.wav"
+        (root / "train.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            renumber_existing(root)
+
+    def test_migration_rolls_back_if_metadata_cannot_be_installed(self):
+        root, rows = self.make_legacy_dataset()
+        hashes = [sha256(root / row["audio"]) for row in rows]
+        manifest = (root / "train.jsonl").read_bytes()
+        import shutil
+
+        original_copy = shutil.copy2
+
+        def fail_on_manifest(source, destination, **kwargs):
+            if Path(source).name == "train.jsonl" and Path(source).parent.name.startswith(".legacy_renumber_"):
+                raise OSError("simulated metadata lock")
+            return original_copy(source, destination, **kwargs)
+
+        with patch("augment.shutil.copy2", side_effect=fail_on_manifest), self.assertRaises(OSError):
+            renumber_existing(root)
+        self.assertEqual((root / "train.jsonl").read_bytes(), manifest)
+        self.assertEqual([sha256(root / row["audio"]) for row in rows], hashes)
+        self.assertFalse((root / "RENUMBERING.json").exists())
 
 
 if __name__ == "__main__":

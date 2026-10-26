@@ -11,19 +11,29 @@ import io
 import json
 import math
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import resample_poly
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from scipy.signal import resample_poly, stft
 
 VERSION = 1
 AUDITION_COLUMNS = ["Name", "Start", "Duration", "Time Format", "Type", "Description"]
+PLOT_SPEC = {
+    "waveform_directory": "waveforms", "spectrogram_directory": "spectrograms",
+    "stft_window": "hann", "stft_window_samples": 1024, "stft_hop_samples": 256,
+    "spectrogram_db_range": [-100, 0], "spectrogram_reference": "STFT amplitude relative to 1 FS",
+    "waveform_envelope_bins": 3000, "dpi": 120,
+}
 
 
 def write_json(path: Path, value: object) -> None:
@@ -298,6 +308,63 @@ def save_pcm(path: Path, x: np.ndarray, sr: int) -> dict:
     return signal_quality(written)
 
 
+def render_audio_plots(audio: Path, output: Path, stem: str) -> dict:
+    """直接绘制实际写出的WAV；包络保留峰值，STFT使用固定幅值参考和色标。"""
+    x, sr = sf.read(audio, dtype="float64")
+    if x.ndim != 1 or len(x) < 2 or not np.isfinite(x).all():
+        raise ValueError(f"绘图需要至少两个采样点的有限单声道音频: {audio}")
+    paths = {"waveform": f"waveforms/{stem}.png", "spectrogram": f"spectrograms/{stem}.png"}
+    for path in paths.values():
+        target = output / path
+        if target.exists():
+            raise FileExistsError(f"拒绝覆盖图片: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+    duration = len(x) / sr
+    fig = Figure(figsize=(12, 3.2), layout="constrained")
+    FigureCanvasAgg(fig)
+    ax = fig.subplots()
+    if len(x) <= PLOT_SPEC["waveform_envelope_bins"] * 2:
+        ax.plot(np.arange(len(x)) / sr, x, linewidth=.6, color="#276b9b")
+    else:
+        # 逐块最小/最大值包络，避免简单抽点遗漏短时冲击。
+        step = math.ceil(len(x) / PLOT_SPEC["waveform_envelope_bins"])
+        starts = np.arange(0, len(x), step)
+        ends = np.minimum(starts + step, len(x))
+        centers = (starts + ends - 1) / (2 * sr)
+        ax.fill_between(centers, np.minimum.reduceat(x, starts), np.maximum.reduceat(x, starts),
+                        color="#276b9b", linewidth=0)
+    ax.set(xlim=(0, duration), ylim=(-1.02, 1.02), xlabel="Time (s)",
+           ylabel="Amplitude (FS)", title=f"{stem} - Waveform")
+    ax.grid(alpha=.2)
+    fig.savefig(output / paths["waveform"], dpi=PLOT_SPEC["dpi"])
+    fig.clear()
+
+    window = min(PLOT_SPEC["stft_window_samples"], len(x))
+    hop = min(PLOT_SPEC["stft_hop_samples"], window)
+    frequencies, times, spectrum = stft(
+        x, fs=sr, window="hann", nperseg=window, noverlap=window - hop,
+        boundary="zeros", padded=True,
+    )
+    db = 20 * np.log10(np.maximum(np.abs(spectrum), 1e-12))
+    # 用STFT帧中心推算像素边界，避免把分析帧错误拉伸到整个音频时长。
+    frequency_step = sr / window
+    extent = [times[0] - hop / (2 * sr), times[-1] + hop / (2 * sr),
+              (frequencies[0] - frequency_step / 2) / 1000,
+              (frequencies[-1] + frequency_step / 2) / 1000]
+    fig = Figure(figsize=(12, 4), layout="constrained")
+    FigureCanvasAgg(fig)
+    ax = fig.subplots()
+    picture = ax.imshow(db, origin="lower", aspect="auto", extent=extent, interpolation="nearest",
+                        cmap="magma", vmin=PLOT_SPEC["spectrogram_db_range"][0],
+                        vmax=PLOT_SPEC["spectrogram_db_range"][1])
+    ax.set(xlim=(0, duration), ylim=(0, sr / 2000), xlabel="Time (s)",
+           ylabel="Frequency (kHz)", title=f"{stem} - Spectrogram")
+    fig.colorbar(picture, ax=ax, label="STFT magnitude (dB re 1 FS)")
+    fig.savefig(output / paths["spectrogram"], dpi=PLOT_SPEC["dpi"])
+    fig.clear()
+    return paths
+
+
 def inventory(input_dir: Path, output: Path) -> dict:
     if output.exists():
         raise FileExistsError(f"拒绝覆盖报告: {output}")
@@ -349,16 +416,19 @@ def generate(config_path: Path, output: Path) -> dict:
     rng = np.random.default_rng(cfg["seed"])
     records, logs = [], []
 
-    def save(recording_id: str, x: np.ndarray, events: list[dict], used: list[Source],
+    def save(derivation_id: str, x: np.ndarray, events: list[dict], used: list[Source],
              details: dict) -> None:
+        recording_id = f"{len(records) + 1:02d}"
         relative_audio = f"audio/{recording_id}.wav"
         quality = save_pcm(output / relative_audio, x, sr)
+        plots = render_audio_plots(output / relative_audio, output, recording_id)
         labels = None
         if events:
             labels = f"labels/{recording_id}.csv"
             export_markers(output / labels, events)
         row = {
             "recording_id": recording_id, "audio": relative_audio,
+            "derivation_id": derivation_id, "plots": plots,
             "group_id": cfg["group_id"], "split": "train", "reviewed": True,
             "events": events, "source_ids": [source.source_id for source in used],
             "source_sha256": [source.quality["sha256"] for source in used],
@@ -446,6 +516,8 @@ def generate(config_path: Path, output: Path) -> dict:
         "maximum_output_peak": max(row["output_quality"]["peak"] for row in logs),
         "output_near_full_scale_samples": any(row["output_quality"]["near_full_scale_fraction"] > 0 for row in logs),
         "manifest": str(output / "train.jsonl"), "processing_seconds": time.perf_counter() - started,
+        "filename_scheme": "sequential_decimal_minimum_2_digits",
+        "waveform_images": len(records), "spectrogram_images": len(records), "plot_spec": PLOT_SPEC,
         "limitations": [
             "Synthetic variants do not increase the number of independent real bolt-drop events.",
             "All sources and derivatives are in one train group; no validation or test data generated.",
@@ -458,6 +530,202 @@ def generate(config_path: Path, output: Path) -> dict:
     return summary
 
 
+def install_renumbered_files(root: Path, stage: Path, backup: Path) -> None:
+    """保留目录本身，逐文件原子替换；适用于Windows中不能移动的打开目录。"""
+    root, stage, backup = root.resolve(strict=True), stage.resolve(strict=True), backup.resolve()
+    if (not stage.is_relative_to(root.parent) or not backup.is_relative_to(root.parent)
+            or not stage.name.startswith(f".{root.name}_renumber_")
+            or backup.parent != root.parent / "_backups"):
+        raise ValueError("迁移目录/备份路径超出预期范围")
+    if any(path.is_symlink() or path.is_junction() for path in stage.rglob("*")):
+        raise ValueError("临时副本包含链接，拒绝迁移")
+    with (stage / "renaming_map.csv").open(encoding="utf-8-sig", newline="") as stream:
+        mapping = list(csv.DictReader(stream))
+    for row in mapping:
+        for key in ("old_audio", "new_audio", "old_labels", "new_labels"):
+            value = row[key]
+            if value and (Path(value).is_absolute() or not (root / value).resolve().is_relative_to(root)):
+                raise ValueError("迁移映射包含越界路径")
+        if sha256(root / row["old_audio"]) != row["wav_sha256"] or sha256(stage / row["new_audio"]) != row["wav_sha256"]:
+            raise ValueError("原音频或临时副本在迁移期间发生变化")
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(root, backup)
+    marker = root / "RENUMBERING.json"
+    write_json(marker, {"status": "incomplete", "backup": str(backup), "stage": str(stage)})
+    installed, removed = [], []
+    token = uuid4().hex
+
+    def replace_from(source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{token}.part")
+        try:
+            shutil.copy2(source, temporary)
+            temporary.replace(destination)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    prepared = [path for path in stage.rglob("*") if path.is_file()]
+    data_directories = {"audio", "labels", "waveforms", "spectrograms"}
+    prepared.sort(key=lambda path: (path.relative_to(stage).parts[0] not in data_directories,
+                                    path.name == "summary.json", str(path)))
+    targets = {path.relative_to(stage) for path in prepared}
+    try:
+        for source in prepared:
+            relative = source.relative_to(stage)
+            replace_from(source, root / relative)
+            installed.append(relative)
+        for row in mapping:
+            for key in ("old_audio", "old_labels"):
+                old = Path(row[key]) if row[key] else None
+                if old is not None and old not in targets:
+                    (root / old).unlink()
+                    removed.append(old)
+    except OSError as exc:
+        # 从完整备份回滚已写入/移除的文件，保留临时副本供定位问题。
+        try:
+            for relative in removed:
+                replace_from(backup / relative, root / relative)
+            for relative in reversed(installed):
+                if (backup / relative).exists():
+                    replace_from(backup / relative, root / relative)
+                elif (root / relative).exists():
+                    (root / relative).unlink()
+            marker.unlink()
+        except OSError as rollback_error:
+            raise OSError(f"迁移失败且回滚未完成；恢复备份: {backup}; {rollback_error}") from exc
+        raise OSError(f"迁移未完成，已回滚；原结果备份: {backup}; {exc}") from exc
+    marker.unlink()
+    # stage已验证为当前数据集父目录中的专用临时目录，原文件另有完整备份。
+    try:
+        shutil.rmtree(stage)
+    except OSError:
+        print(f"Warning: migrated successfully; temporary copy remains at {stage}", file=sys.stderr)
+
+
+def renumber_existing(root: Path) -> dict:
+    """在副本中迁移既有数据、补图，核对WAV哈希后替换，原目录保留为备份。"""
+    started = time.perf_counter()
+    root = root.resolve(strict=True)
+    if any((root / name).exists() for name in ("RUNNING.json", "RENUMBERING.json", ".git")):
+        raise ValueError("请选择已生成完成的数据集目录，而不是项目根目录或半成品目录")
+    if any(path.is_symlink() or path.is_junction() for path in root.rglob("*")):
+        raise ValueError("数据集包含符号链接/目录联接，不能安全迁移")
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8-sig"))
+    if summary.get("status") != "complete":
+        raise ValueError("原数据集尚未完成，不能迁移")
+    records = [json.loads(line) for line in (root / "train.jsonl").read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    log_rows = [json.loads(line) for line in (root / "augmentation_log.jsonl").read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    old_ids = [row["recording_id"] for row in records]
+    logs = {row["recording_id"]: row for row in log_rows}
+    if not records or len(set(old_ids)) != len(records) or set(old_ids) != set(logs) or len(log_rows) != len(records):
+        raise ValueError("训练清单和日志的样本ID不一致或存在重复")
+    with (root / "quality.csv").open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        quality_columns = reader.fieldnames
+        quality_rows = list(reader)
+    if len(quality_rows) != len(records) or {row["recording_id"] for row in quality_rows} != set(old_ids):
+        raise ValueError("质量表和训练清单不一致")
+
+    def inside(relative: str) -> Path:
+        path = Path(relative)
+        if path.is_absolute() or not (root / path).resolve().is_relative_to(root):
+            raise ValueError(f"文件引用超出数据集目录: {relative}")
+        return root / path
+
+    mapping, moves = [], []
+    current = True
+    for index, row in enumerate(records, 1):
+        new_id = f"{index:02d}"
+        new_audio = f"audio/{new_id}.wav"
+        new_labels = f"labels/{new_id}.csv" if row.get("labels") else None
+        audio = inside(row["audio"])
+        if not audio.is_file() or logs[row["recording_id"]]["audio"] != row["audio"]:
+            raise ValueError(f"清单与音频/日志不一致: {row['recording_id']}")
+        moves.append((row["audio"], new_audio))
+        if row.get("labels"):
+            if not inside(row["labels"]).is_file():
+                raise ValueError(f"标记文件不存在: {row['labels']}")
+            moves.append((row["labels"], new_labels))
+        plots = {"waveform": f"waveforms/{new_id}.png", "spectrogram": f"spectrograms/{new_id}.png"}
+        current &= (row["recording_id"] == new_id and row["audio"] == new_audio
+                    and row.get("labels") == new_labels and row.get("plots") == plots
+                    and all(inside(path).is_file() for path in plots.values()))
+        mapping.append({"old_recording_id": row["recording_id"], "new_recording_id": new_id,
+                        "old_audio": row["audio"], "new_audio": new_audio,
+                        "old_labels": row.get("labels") or "", "new_labels": new_labels or "",
+                        "wav_sha256": sha256(audio)})
+    if current:
+        return {"status": "unchanged", "recordings": len(records), "directory": str(root)}
+    previous_paths = {old for old, _ in moves}
+    if len(previous_paths) != len(moves):
+        raise ValueError("多条样本引用同一个文件")
+    for old, new in moves:
+        if inside(new).exists() and new not in previous_paths:
+            raise FileExistsError(f"目标文件与清单外文件冲突: {new}")
+    if {path.resolve() for path in (root / "audio").rglob("*.wav")} != {
+        inside(row["audio"]).resolve() for row in records
+    }:
+        raise ValueError("audio目录中有未列入清单的WAV，请先确认它们的来源")
+
+    token = uuid4().hex[:12]
+    stage = root.parent / f".{root.name}_renumber_{token}"
+    backup = root.parent / "_backups" / f"{root.name}_before_renumber_{token}"
+    # Windows目录移动前校验最终绝对路径；不递归删除任何原始目录。
+    if not stage.resolve().is_relative_to(root.parent) or not backup.resolve().is_relative_to(root.parent):
+        raise ValueError("临时/备份路径超出指定数据集的父目录")
+    shutil.copytree(root, stage)
+    temporary_moves = []
+    for index, (old, new) in enumerate(moves):
+        temporary = stage / f".rename_{token}_{index}{Path(old).suffix}"
+        (stage / old).rename(temporary)
+        temporary_moves.append((temporary, stage / new))
+    for temporary, destination in temporary_moves:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary.rename(destination)
+
+    for index, (row, entry) in enumerate(zip(records, mapping), 1):
+        old_id, new_id = entry["old_recording_id"], entry["new_recording_id"]
+        plots = {"waveform": f"waveforms/{new_id}.png", "spectrogram": f"spectrograms/{new_id}.png"}
+        if not all((stage / path).is_file() for path in plots.values()):
+            for path in plots.values():
+                target = stage / path
+                if target.exists():
+                    target.unlink()  # 仅移除临时副本中待补齐的该样本图片。
+            render_audio_plots(stage / entry["new_audio"], stage, new_id)
+        replacement = {"recording_id": new_id, "audio": entry["new_audio"],
+                       "labels": entry["new_labels"] or None, "plots": plots,
+                       "derivation_id": row.get("derivation_id", old_id)}
+        row.update(replacement)
+        logs[old_id].update(replacement)
+        if sha256(stage / entry["new_audio"]) != entry["wav_sha256"]:
+            raise ValueError(f"迁移后WAV内容发生变化，原目录仍保留: {old_id}")
+        if index % 10 == 0 or index == len(records):
+            print(f"Renumbered and plotted {index}/{len(records)}", flush=True)
+    for name, rows in (("train.jsonl", records), ("augmentation_log.jsonl", log_rows)):
+        (stage / name).write_text("".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows), encoding="utf-8")
+    id_mapping = {row["old_recording_id"]: row["new_recording_id"] for row in mapping}
+    with (stage / "quality.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=quality_columns)
+        writer.writeheader()
+        for row in quality_rows:
+            writer.writerow({**row, "recording_id": id_mapping[row["recording_id"]]})
+    with (stage / "renaming_map.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(mapping[0]))
+        writer.writeheader()
+        writer.writerows(mapping)
+    summary.update({"manifest": str(root / "train.jsonl"),
+                    "filename_scheme": "sequential_decimal_minimum_2_digits",
+                    "waveform_images": len(records), "spectrogram_images": len(records),
+                    "plot_spec": PLOT_SPEC, "renumber_backup": str(backup),
+                    "renumber_processing_seconds": time.perf_counter() - started})
+    write_json(stage / "summary.json", summary)
+    install_renumbered_files(root, stage, backup)
+    return {"status": "complete", "recordings": len(records), "directory": str(root),
+            "backup": str(backup), "waveform_images": len(records), "spectrogram_images": len(records),
+            "audio_content_changed": False}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -467,10 +735,14 @@ def main() -> int:
     make = sub.add_parser("generate", help="按已确认的来源配置生成训练增强集")
     make.add_argument("--config", type=Path, default=Path(__file__).with_name("augmentation.json"))
     make.add_argument("--output", type=Path, required=True, help="必须是不存在的新目录")
+    rename = sub.add_parser("renumber", help="将既有完整数据集改为连续编号，补齐两类图片并保留备份")
+    rename.add_argument("--input", type=Path, required=True, help="包含train.jsonl和summary.json的数据集目录")
     args = parser.parse_args()
     try:
         if args.command == "scan":
             result = inventory(args.input.resolve(strict=True), args.output)
+        elif args.command == "renumber":
+            result = renumber_existing(args.input)
         else:
             result = generate(args.config, args.output)
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
