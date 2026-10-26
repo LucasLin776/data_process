@@ -1,4 +1,4 @@
-"""螺栓声音数据增强：真实背景混合、时间标签、训练清单和来源审计。
+"""螺栓声音数据增强：真实背景混合、三频段随机均衡和来源审计。
 
 所有合成数据仅用于训练；不自动生成验证集或测试集。
 """
@@ -24,7 +24,7 @@ import numpy as np
 import soundfile as sf
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from scipy.signal import resample_poly, stft
+from scipy.signal import firwin2, oaconvolve, resample_poly, stft
 
 VERSION = 1
 AUDITION_COLUMNS = ["Name", "Start", "Duration", "Time Format", "Type", "Description"]
@@ -167,6 +167,83 @@ def resolve_path(value: str, base: Path) -> Path:
     return (path if path.is_absolute() else base / path).resolve(strict=True)
 
 
+def random_eq_settings(cfg: dict) -> dict:
+    """旧配置缺少random_eq时保持关闭；开启时严格校验频率与增益。"""
+    raw = cfg.get("random_eq", {})
+    if not isinstance(raw, dict):
+        raise ValueError("random_eq必须是对象")
+    settings = {
+        "enabled": False, "gain_db": [-3., 3.], "crossovers_hz": [500., 4000.],
+        "transition_fraction": .2, "fir_taps": 513, "source_variants": 1,
+        **raw,
+    }
+    if type(settings["enabled"]) is not bool:
+        raise ValueError("random_eq.enabled必须是布尔值")
+    if not settings["enabled"]:
+        return settings
+
+    def finite_number(value: object) -> bool:
+        return type(value) in (int, float) and math.isfinite(value)
+
+    gains = settings["gain_db"]
+    if (not isinstance(gains, list) or len(gains) != 2
+            or not all(finite_number(value) for value in gains)
+            or not -6 <= gains[0] <= gains[1] <= 6):
+        raise ValueError("random_eq.gain_db必须是[-6,6]dB范围内的[最小值,最大值]")
+    fraction = settings["transition_fraction"]
+    if not finite_number(fraction) or not 0 < fraction < .5:
+        raise ValueError("random_eq.transition_fraction必须介于0和0.5之间")
+    crossovers = settings["crossovers_hz"]
+    if (not isinstance(crossovers, list) or len(crossovers) != 2
+            or not all(finite_number(value) for value in crossovers)):
+        raise ValueError("random_eq.crossovers_hz必须是两个有限频率")
+    low, high = crossovers
+    if not (0 < low * (1 - fraction) < low * (1 + fraction)
+            < high * (1 - fraction) < high * (1 + fraction) < cfg["sample_rate"] / 2):
+        raise ValueError("random_eq频段过渡带必须递增、不重叠且低于奈奎斯特频率")
+    taps = settings["fir_taps"]
+    if type(taps) is not int or not 33 <= taps <= 8193 or taps % 2 == 0:
+        raise ValueError("random_eq.fir_taps必须是33～8193之间的奇数")
+    variants = settings["source_variants"]
+    if type(variants) is not int or not 1 <= variants <= 100:
+        raise ValueError("random_eq.source_variants必须是1～100之间的整数")
+    return settings
+
+
+def sample_equalizer(cfg: dict, rng: np.random.Generator) -> tuple[np.ndarray | None, dict]:
+    """三段独立抽样；用SciPy线性相位FIR和连续过渡带避免频域硬切。"""
+    settings = random_eq_settings(cfg)
+    if not settings["enabled"]:
+        return None, {"applied": False}
+    sr = cfg["sample_rate"]
+    low, high = settings["crossovers_hz"]
+    fraction = settings["transition_fraction"]
+    gains_db = rng.uniform(*settings["gain_db"], size=3)
+    gains = 10 ** (gains_db / 20)
+    frequencies = [0., low * (1 - fraction), low * (1 + fraction),
+                   high * (1 - fraction), high * (1 + fraction), sr / 2]
+    taps = firwin2(settings["fir_taps"], frequencies, np.repeat(gains, 2), fs=sr, window="hann")
+    half = (len(taps) - 1) // 2
+    return taps, {
+        "applied": True, "method": "scipy_firwin2_hann_linear_phase",
+        "gain_db": dict(zip(("low", "mid", "high"), map(float, gains_db))),
+        "crossovers_hz": list(settings["crossovers_hz"]),
+        "transition_edges_hz": [frequencies[1:3], frequencies[3:5]],
+        "fir_taps": len(taps), "delay_compensated_samples": half,
+        "maximum_temporal_spread_s": half / sr, "boundary_padding": "reflect",
+        "sample_rate": sr, "event_time_mapping": "unchanged; filter delay compensated",
+    }
+
+
+def apply_equalizer(x: np.ndarray, taps: np.ndarray | None) -> np.ndarray:
+    """对称填充后valid卷积消除FIR延迟，保持长度；不做归一化或裁剪。"""
+    if taps is None:
+        return x
+    half = (len(taps) - 1) // 2
+    padded = np.pad(x, (half, half), mode="reflect")
+    return np.ascontiguousarray(oaconvolve(padded, taps, mode="valid"))
+
+
 def load_config(path: Path) -> tuple[dict, list[Source]]:
     cfg = json.loads(path.read_text(encoding="utf-8-sig"))
     if cfg.get("version") != VERSION:
@@ -174,6 +251,7 @@ def load_config(path: Path) -> tuple[dict, list[Source]]:
     sr = cfg["sample_rate"]
     if type(sr) is not int or not 1000 <= sr <= 192000:
         raise ValueError("sample_rate必须为1000～192000的整数")
+    random_eq_settings(cfg)
     duration = cfg["duration_s"]
     if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0:
         raise ValueError("duration_s必须为正数")
@@ -269,20 +347,25 @@ def event_clip(source: Source, index: int, cfg: dict) -> tuple[np.ndarray, int, 
 
 def mix_at_snr(background: np.ndarray, foreground: np.ndarray, start: int,
                active_start: int, active_end: int, snr_db: float,
-               peak_limit: float, gain_db: float) -> tuple[np.ndarray, np.ndarray, dict]:
-    """事件标注区间内计算功率；正例与配对负例应用完全相同的全局增益。"""
+               peak_limit: float, gain_db: float, *,
+               eq_taps: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, dict]:
+    """背景/完整前景共享EQ，在EQ后设SNR；正负例共享输出增益。"""
     if not 0 <= start <= len(background) - len(foreground):
         raise ValueError("事件及其上下文放不进背景")
     if not 0 <= active_start < active_end <= len(foreground):
         raise ValueError("无效事件活动区间")
     active = slice(start + active_start, start + active_end)
-    signal_power = float(np.mean(np.square(foreground[active_start:active_end])))
+    event = np.zeros_like(background)
+    event[start:start + len(foreground)] = foreground
+    # 先放进完整时间轴再滤波，不在裁出的事件边界截断滤波响应。
+    background = apply_equalizer(background, eq_taps)
+    event = apply_equalizer(event, eq_taps)
+    signal_power = float(np.mean(np.square(event[active])))
     noise_power = float(np.mean(np.square(background[active])))
     if min(signal_power, noise_power) <= 1e-16:
         raise ValueError("事件或对应背景接近静音，不能按指定信噪比混合")
     multiplier = math.sqrt(noise_power / signal_power) * 10 ** (snr_db / 20)
-    event = np.zeros_like(background)
-    event[start:start + len(foreground)] = foreground * multiplier
+    event *= multiplier
     mixed = background + event
     # 同时考虑正例和配对负例的峰值，保留相同背景音量，避免响度泄露标签。
     peak = max(float(np.max(np.abs(mixed))), float(np.max(np.abs(background))))
@@ -295,6 +378,7 @@ def mix_at_snr(background: np.ndarray, foreground: np.ndarray, start: int,
         "foreground_multiplier": multiplier, "output_gain_db_requested": float(gain_db),
         "headroom_gain": headroom, "common_output_gain": gain,
         "pre_mix_signal_power": signal_power, "pre_mix_background_power": noise_power,
+        "snr_measured_after_eq": eq_taps is not None,
     }
 
 
@@ -414,10 +498,14 @@ def generate(config_path: Path, output: Path) -> dict:
                      "events": source.events, "annotation": source.annotation} for source in sources],
     })
     rng = np.random.default_rng(cfg["seed"])
+    # EQ使用独立随机流，开关EQ不会改变原有位置、背景裁剪和全局增益抽样。
+    eq_rng = np.random.default_rng(np.random.SeedSequence([cfg["seed"], 0x4551]))
+    eq_settings = random_eq_settings(cfg)
     records, logs = [], []
 
     def save(derivation_id: str, x: np.ndarray, events: list[dict], used: list[Source],
              details: dict) -> None:
+        details = {"random_eq": {"applied": False}, **details}
         recording_id = f"{len(records) + 1:02d}"
         relative_audio = f"audio/{recording_id}.wav"
         quality = save_pcm(output / relative_audio, x, sr)
@@ -453,6 +541,22 @@ def generate(config_path: Path, output: Path) -> dict:
             "common_output_gain": gain, "original_events": source.events,
         })
 
+    # 原始统一格式版本照常保留；所有来源类别都补EQ版本，包括困难负例。
+    if eq_settings["enabled"]:
+        for source in sources:
+            for variant in range(1, eq_settings["source_variants"] + 1):
+                taps, equalizer = sample_equalizer(cfg, eq_rng)
+                x = apply_equalizer(source.x[:frames], taps)
+                peak = float(np.max(np.abs(x)))
+                gain = min(1., cfg["peak_limit"] / peak) if peak else 1.
+                events = [{"start_s": round(event["start_s"] * sr) / sr,
+                           "end_s": round(event["end_s"] * sr) / sr} for event in source.events]
+                save(f"eq_{source.source_id}_{variant:03d}", x * gain, events, [source], {
+                    "kind": f"equalized_source_{source.role}", "source_offset_s": 0.,
+                    "source_variant": variant, "common_output_gain": gain,
+                    "original_events": source.events, "random_eq": equalizer,
+                })
+
     for foreground, index, clip, active_left, active_right in clips:
         for background in backgrounds:
             variant = 0
@@ -463,9 +567,10 @@ def generate(config_path: Path, output: Path) -> dict:
                     bg = background.x[background_start:background_start + frames]
                     position = int(rng.integers(0, frames - len(clip) + 1))
                     gain_db = float(rng.uniform(*cfg["output_gain_db"]))
+                    taps, equalizer = sample_equalizer(cfg, eq_rng)
                     positive, paired_negative, settings = mix_at_snr(
                         bg, clip, position, active_left, active_right,
-                        snr_db, cfg["peak_limit"], gain_db,
+                        snr_db, cfg["peak_limit"], gain_db, eq_taps=taps,
                     )
                     events = [{"start_s": (position + active_left) / sr,
                                "end_s": (position + active_right) / sr}]
@@ -477,7 +582,7 @@ def generate(config_path: Path, output: Path) -> dict:
                         "background_offset_s": background_start / sr,
                         "foreground_context_position_s": position / sr,
                         "context_s_requested": cfg["context_s"],
-                        "fade_s_requested": cfg["fade_s"], **settings,
+                        "fade_s_requested": cfg["fade_s"], "random_eq": equalizer, **settings,
                     }
                     save(f"pos_{pair_id}", positive, events, [foreground, background],
                          {**details, "kind": "positive_mixture"})
@@ -511,6 +616,9 @@ def generate(config_path: Path, output: Path) -> dict:
         "negative_recordings": sum(not row["events"] for row in records),
         "mixed_positive_recordings": sum(row["synthetic"] for row in records),
         "paired_negative_recordings": sum(row["augmentation"]["kind"] == "paired_background_only" for row in logs),
+        "random_eq": eq_settings,
+        "random_eq_augmented_recordings": sum(row["augmentation"]["random_eq"]["applied"] for row in logs),
+        "equalized_source_recordings": sum(row["augmentation"]["kind"].startswith("equalized_source_") for row in logs),
         "source_warnings": [{"id": source.source_id, "warnings": source.quality["warnings"]}
                             for source in sources if source.quality["warnings"]],
         "maximum_output_peak": max(row["output_quality"]["peak"] for row in logs),
@@ -523,6 +631,7 @@ def generate(config_path: Path, output: Path) -> dict:
             "All sources and derivatives are in one train group; no validation or test data generated.",
             "Source clipping and residual foreground noise remain; mixing approximates operating conditions.",
             "Time labels come from reviewed source markers; generated files are not individually listened.",
+            "EQ preserves duration and compensates FIR delay; short filter spreading around transients remains.",
         ],
     }
     write_json(output / "summary.json", summary)

@@ -11,6 +11,14 @@
   "peak_limit": 0.95,
   "context_s": 0.02,
   "fade_s": 0.005,
+  "random_eq": {
+    "enabled": true,
+    "gain_db": [-3, 3],
+    "crossovers_hz": [500, 4000],
+    "transition_fraction": 0.2,
+    "fir_taps": 513,
+    "source_variants": 1
+  },
   "foregrounds": [
     {"id": "bolt_001", "audio": "../螺栓掉落.wav", "markers": "../标记.csv", "reviewed": true}
   ],

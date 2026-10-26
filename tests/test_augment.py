@@ -9,9 +9,11 @@ from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
+from scipy.signal import freqz
 
 from augment import (
     Source,
+    apply_equalizer,
     event_clip,
     export_markers,
     generate,
@@ -19,12 +21,67 @@ from augment import (
     mix_at_snr,
     read_audio,
     read_markers,
+    random_eq_settings,
     renumber_existing,
+    sample_equalizer,
     sha256,
 )
 
 
 class MixingTests(unittest.TestCase):
+    def test_eq_band_gains_alignment_and_no_circular_wrap(self):
+        cfg = {"sample_rate": 32000, "random_eq": {"enabled": True}}
+        taps, log = sample_equalizer(cfg, np.random.default_rng(3))
+        _, response = freqz(taps, worN=np.array([100., 1500., 10000.]), fs=32000)
+        actual = 20 * np.log10(np.abs(response))
+        np.testing.assert_allclose(actual, list(log["gain_db"].values()), atol=.05)
+        self.assertEqual(log["delay_compensated_samples"], 256)
+        self.assertEqual(log["maximum_temporal_spread_s"], .008)
+        impulse = np.zeros(32000)
+        impulse[12000] = 1.
+        transformed = apply_equalizer(impulse, taps)
+        self.assertEqual(len(transformed), len(impulse))
+        self.assertEqual(np.argmax(np.abs(transformed)), 12000)
+        np.testing.assert_allclose(transformed[:11000], 0, atol=1e-14)
+        np.testing.assert_allclose(transformed[13000:], 0, atol=1e-14)
+
+    def test_flat_eq_and_disabled_eq_preserve_signal(self):
+        x = np.random.default_rng(10).normal(0, .1, 16000)
+        cfg = {"sample_rate": 32000, "random_eq": {"enabled": True, "gain_db": [0, 0]}}
+        taps, _ = sample_equalizer(cfg, np.random.default_rng(1))
+        np.testing.assert_allclose(apply_equalizer(x, taps), x, atol=1e-14)
+        taps, log = sample_equalizer({"sample_rate": 32000}, np.random.default_rng(1))
+        self.assertIsNone(taps)
+        self.assertFalse(log["applied"])
+        self.assertIs(apply_equalizer(x, taps), x)
+
+    def test_eq_pair_shares_response_and_achieves_snr_after_filtering(self):
+        rng = np.random.default_rng(8)
+        bg, fg = rng.normal(0, .2, 16000), rng.normal(0, .1, 4000)
+        taps, _ = sample_equalizer({"sample_rate": 32000, "random_eq": {"enabled": True}}, rng)
+        for snr in (-5, 0, 10):
+            positive, negative, log = mix_at_snr(bg, fg, 5000, 100, 3900, snr, .95, -3, eq_taps=taps)
+            np.testing.assert_allclose(negative, apply_equalizer(bg, taps) * log["common_output_gain"])
+            event = positive - negative
+            active = slice(5100, 8900)
+            actual = 10 * np.log10(np.mean(event[active] ** 2) / np.mean(negative[active] ** 2))
+            self.assertAlmostEqual(actual, snr, places=10)
+            self.assertTrue(log["snr_measured_after_eq"])
+            np.testing.assert_allclose(positive[:4700], negative[:4700], atol=1e-14)
+            np.testing.assert_allclose(positive[9300:], negative[9300:], atol=1e-14)
+            self.assertLessEqual(max(abs(positive).max(), abs(negative).max()), .95)
+
+    def test_eq_invalid_gains_frequencies_and_taps_rejected(self):
+        cases = [[], {"enabled": "yes"}, {"gain_db": [-7, 3]},
+                 {"gain_db": [0, float("nan")]}, {"crossovers_hz": [4000, 500]},
+                 {"crossovers_hz": [500, 15000]}, {"transition_fraction": 0},
+                 {"fir_taps": 512}, {"source_variants": 0}]
+        for raw in cases:
+            cfg = {"sample_rate": 32000,
+                   "random_eq": {"enabled": True, **raw} if isinstance(raw, dict) else raw}
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                random_eq_settings(cfg)
+
     def test_snr_and_paired_background_share_gain(self):
         rng = np.random.default_rng(5)
         bg = rng.normal(0, .3, 16000)
@@ -166,6 +223,54 @@ class FileTests(unittest.TestCase):
             path.write_text(json.dumps(altered), encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_config(path)
+
+    def test_eq_generation_covers_all_roles_preserves_labels_and_is_reproducible(self):
+        cfg, config = self.make_config()
+        cfg["random_eq"] = {"enabled": True, "crossovers_hz": [400, 1500]}
+        config.write_text(json.dumps(cfg), encoding="utf-8")
+        first, second, baseline = self.root / "eq1", self.root / "eq2", self.root / "baseline"
+        # 绘图已有集成覆盖；本测试隔离EQ、标签、SNR、复现及随机流逻辑。
+        with patch("augment.render_audio_plots", return_value={}):
+            summary = generate(config, first)
+            generate(config, second)
+            cfg["random_eq"]["enabled"] = False
+            config.write_text(json.dumps(cfg), encoding="utf-8")
+            generate(config, baseline)
+        self.assertEqual(summary["total_recordings"], 14)
+        self.assertEqual(summary["positive_recordings"], 6)
+        self.assertEqual(summary["equalized_source_recordings"], 3)
+        self.assertEqual(summary["random_eq_augmented_recordings"], 11)
+
+        def load_logs(root):
+            return [json.loads(line) for line in (root / "augmentation_log.jsonl").read_text(encoding="utf-8").splitlines()]
+
+        logs = load_logs(first)
+        baseline_logs = {row["derivation_id"]: row for row in load_logs(baseline)}
+        pairs = {}
+        eq_roles = set()
+        for row in logs:
+            self.assertEqual(sha256(first / row["audio"]), sha256(second / row["audio"]))
+            self.assertLessEqual(sf.read(first / row["audio"])[0].max(), .95004)
+            details = row["augmentation"]
+            if details["kind"].startswith("equalized_source_"):
+                eq_roles.add(details["kind"])
+                original = baseline_logs["original_" + row["source_ids"][0]]
+                self.assertEqual(row["events"], original["events"])
+                self.assertTrue(details["random_eq"]["applied"])
+            if "pair_id" in details:
+                pairs.setdefault(details["pair_id"], []).append(row)
+                original = baseline_logs[row["derivation_id"]]
+                for key in ("background_offset_s", "foreground_context_position_s", "output_gain_db_requested"):
+                    self.assertEqual(details[key], original["augmentation"][key])
+                self.assertEqual(row["events"], original["events"])
+                self.assertTrue(details["snr_measured_after_eq"])
+            if row["events"]:
+                self.assertEqual(read_markers(first / row["labels"], 2), row["events"])
+        self.assertEqual(eq_roles, {"equalized_source_foreground", "equalized_source_background", "equalized_source_hard_negative"})
+        for pair in pairs.values():
+            self.assertEqual(len(pair), 2)
+            self.assertEqual(pair[0]["augmentation"]["random_eq"], pair[1]["augmentation"]["random_eq"])
+            self.assertEqual(pair[0]["augmentation"]["common_output_gain"], pair[1]["augmentation"]["common_output_gain"])
 
     def test_resampling_channel_selection_and_quality_warning(self):
         left = np.ones(16000) * .1
