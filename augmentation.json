@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "sample_rate": 32000,
+  "duration_s": 30,
+  "channel": 0,
+  "seed": 20261026,
+  "group_id": "collected_pool_20261026",
+  "snr_db": [-5, 0, 5, 10],
+  "repeats_per_snr": 2,
+  "output_gain_db": [-6, 0],
+  "peak_limit": 0.95,
+  "context_s": 0.02,
+  "fade_s": 0.005,
+  "foregrounds": [
+    {"id": "bolt_001", "audio": "../螺栓掉落.wav", "markers": "../标记.csv", "reviewed": true}
+  ],
+  "backgrounds": [
+    {"id": "bg_low", "audio": "../数据增强/低正常.wav", "reviewed": true},
+    {"id": "bg_medium", "audio": "../数据增强/中正常.wav", "reviewed": true},
+    {"id": "bg_medium_2", "audio": "../数据增强/中正常2.wav", "reviewed": true},
+    {"id": "bg_high", "audio": "../数据增强/高正常.wav", "reviewed": true}
+  ],
+  "hard_negatives": [
+    {"id": "interference_001", "audio": "../数据增强/胶粒掉落.wav", "reviewed": true},
+    {"id": "interference_002", "audio": "../数据增强/胶粒掉落2.wav", "reviewed": true},
+    {"id": "interference_003", "audio": "../数据增强/胶粒掉落3.wav", "reviewed": true},
+    {"id": "interference_004", "audio": "../数据增强/胶粒掉落4.wav", "reviewed": true}
+  ]
+}
